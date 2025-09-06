@@ -1,0 +1,138 @@
+name: Continuous Persistent VPS
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'   # restart every 6 hours
+
+jobs:
+  vps-session:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    env:
+      VPS_USERNAME: "root"
+      VPS_PASSWORD: "WorldCraftLink"
+      HOSTNAME: "worldcraftlink"
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download Tailscale state
+        uses: actions/download-artifact@v4
+        with:
+          name: tailscale-state
+          path: ./backup
+        continue-on-error: true
+
+      - name: Set hostname
+        run: sudo hostnamectl set-hostname $HOSTNAME
+
+      - name: Install prerequisites
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            zip unzip curl jq net-tools rsync nginx \
+            python3 python3-pip dropbear
+          echo "✅ Dependencies installed"
+
+      - name: Install Tailscale
+        run: curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Restore Tailscale state
+        run: |
+          if [ -f ./backup/tailscaled.state ]; then
+            echo "✅ Restoring previous Tailscale identity"
+            sudo mkdir -p /var/lib/tailscale
+            sudo cp ./backup/tailscaled.state /var/lib/tailscale/tailscaled.state
+            sudo chmod 600 /var/lib/tailscale/tailscaled.state
+          fi
+
+      - name: Start Tailscale
+        run: |
+          sudo tailscaled --state=/var/lib/tailscale/tailscaled.state &
+          sleep 8
+          sudo tailscale up --authkey $TAILSCALE_AUTHKEY --hostname=$HOSTNAME --accept-routes --advertise-exit-node
+          echo "✅ Tailscale started"
+
+      - name: Setup Dropbear SSH
+        run: |
+          echo "root:$VPS_PASSWORD" | sudo chpasswd
+          sudo mkdir -p /etc/dropbear
+          sudo dropbear -p 22 -r /etc/dropbear/dropbear_rsa_host_key -E -F -w -s &
+          echo "✅ Dropbear SSH enabled (root login with password)"
+
+      - name: Run Playit tunnel
+        run: |
+          rm -f ~/.playit/playit.toml || true
+          nohup bash <(curl -fsSL https://raw.githubusercontent.com/hopingboyz/playit/main/playit.sh) > playit.log 2>&1 &
+          sleep 35
+          echo "✅ Playit tunnel started"
+
+      - name: Extract Playit claim link
+        id: playitclaim
+        run: |
+          CLAIM_LINK=$(grep -oP 'https://playit.gg/claim/\S+' playit.log | tail -n1 || true)
+          echo "CLAIM_LINK=$CLAIM_LINK" >> $GITHUB_ENV
+          if [ -n "$CLAIM_LINK" ]; then
+            echo "✅ Found Playit claim link: $CLAIM_LINK"
+          else
+            echo "⚠️ No claim link found in playit.log"
+          fi
+
+      - name: Show SSH info
+        id: sshinfo
+        run: |
+          TAIL_IP=$(tailscale ip -4 | head -n1)
+          PLAYIT_ADDR=$(grep -oP 'Starting a new connection to: \"\K[^\"]+' playit.log | tail -n1)
+          PLAYIT_PORT=$(grep -oP 'port \"\K[0-9]+' playit.log | tail -n1)
+
+          echo "TAIL_IP=$TAIL_IP" >> $GITHUB_ENV
+          echo "PLAYIT_ADDR=$PLAYIT_ADDR" >> $GITHUB_ENV
+          echo "PLAYIT_PORT=$PLAYIT_PORT" >> $GITHUB_ENV
+
+      - name: Send info to Discord
+        if: always()
+        run: |
+          MESSAGE="✅ VPS is online (6h session, auto-renewed 24/7)\n\n\
+          \`\`\`ini\n\
+          [Tailscale SSH]\n\
+          ssh root@${TAIL_IP}\n\
+          Password = ${VPS_PASSWORD}\n\n\
+          [Playit SSH]\n\
+          ssh root@${PLAYIT_ADDR} -p ${PLAYIT_PORT}\n\
+          Password = ${VPS_PASSWORD}\n\
+          \`\`\`\n"
+
+          if [ -n "${CLAIM_LINK}" ]; then
+            MESSAGE="$MESSAGE\n\n🌐 **Playit Claim Link:** ${CLAIM_LINK}"
+          fi
+
+          curl -H "Content-Type: application/json" \
+               -d "{\"content\": \"$MESSAGE\"}" \
+               $DISCORD_WEBHOOK_URL
+
+      - name: Sleep to keep alive
+        run: sleep 21600   # 6 hours
+
+      - name: Backup Tailscale state
+        run: |
+          mkdir -p backup
+          sudo cp /var/lib/tailscale/tailscaled.state ./backup/
+          echo "✅ State saved"
+
+      - name: Upload Tailscale state
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-state
+          path: ./backup/tailscaled.state
+
+      - name: Self-dispatch for auto-restart
+        if: always()
+        run: |
+          gh workflow run "Continuous Persistent VPS"
+          echo "♻️ Triggered next cycle automatically"
