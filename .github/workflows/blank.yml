@@ -1,4 +1,4 @@
-name: Continuous Persistent VPS
+name: Continuous Persistent VPS1
 
 on:
   workflow_dispatch:
@@ -12,11 +12,10 @@ jobs:
 
     env:
       VPS_USERNAME: "root"
-      VPS_PASSWORD: "WorldCraftLink"
+      VPS_PASSWORD: "worldcraftlink"
       HOSTNAME: "worldcraftlink"
       TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout repo
@@ -59,18 +58,29 @@ jobs:
           sudo tailscale up --authkey $TAILSCALE_AUTHKEY --hostname=$HOSTNAME --accept-routes --advertise-exit-node
           echo "✅ Tailscale started"
 
-      - name: Setup Dropbear SSH
+      - name: Enable root + password login
         run: |
-          echo "$VPS_USERNAME:$VPS_PASSWORD" | sudo chpasswd
           sudo mkdir -p /etc/dropbear
+          # Generate RSA host key if missing
           if [ ! -f /etc/dropbear/dropbear_rsa_host_key ]; then
             sudo dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key
           fi
-          sudo dropbear -p 22 -r /etc/dropbear/dropbear_rsa_host_key -E &
-          echo "✅ Dropbear SSH enabled (root login + password)"
 
-      - name: Run Playit tunnel
+          # Force OpenSSH config to allow root + password
+          sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+
+          # Apply root password
+          echo "$VPS_USERNAME:$VPS_PASSWORD" | sudo chpasswd
+
+          # Start Dropbear on port 22
+          sudo dropbear -p 22 -r /etc/dropbear/dropbear_rsa_host_key -E &
+          sleep 2
+          pgrep dropbear && echo "✅ Dropbear running with root password enabled" || echo "❌ Dropbear failed"
+
+      - name: Run Playit tunnel (fresh claim link each time)
         run: |
+          rm -f ~/.playit/playit.toml || true
           nohup bash <(curl -fsSL https://raw.githubusercontent.com/hopingboyz/playit/main/playit.sh) > playit.log 2>&1 &
           sleep 35
           echo "✅ Playit tunnel started"
@@ -89,11 +99,11 @@ jobs:
           echo "========================================"
           echo " SSH LOGIN INFO "
           echo "----------------------------------------"
-          echo "Tailscale SSH (root + password): ssh root@${TAIL_IP}"
+          echo "Tailscale SSH: ssh root@${TAIL_IP}"
           echo "Password: $VPS_PASSWORD"
           echo ""
           if [ -n "$PLAYIT_ADDR" ] && [ -n "$PLAYIT_PORT" ]; then
-            echo "Playit SSH (root + password): ssh root@${PLAYIT_ADDR} -p ${PLAYIT_PORT}"
+            echo "Playit SSH: ssh root@${PLAYIT_ADDR} -p ${PLAYIT_PORT}"
             echo "Password: $VPS_PASSWORD"
           else
             echo "⚠️ Could not detect Playit tunnel. Check playit.log"
